@@ -12,39 +12,21 @@
 #include <thread>
 #include <iostream>
 
-struct msg1 {
-  int i;
-  float j;
+struct msg1 { int i; float j; };
+struct sub1 {
+  bool accepted = false;
+  using MessageType = msg1;
+  void process(msg1&& msg){ accepted = true; }
 };
 
-class sub1 {
-
-  public:
-    bool accepted = false;
-
-    using MessageType = msg1;
-    void process(msg1&& msg){
-      accepted = true;
-    }
+struct msg2 { int i; float j; };
+struct sub2 {
+  bool accepted = false;
+  using MessageType = msg2;
+  void process(msg2&&){ accepted = true; }
 };
 
-struct msg2 {
-  int i;
-  float j;
-};
-
-class sub2 {
-
-  public:
-    bool accepted = false;
-
-    using MessageType = msg2;
-    void process(msg2&&){
-      accepted = true;
-    }
-};
-
-
+// this could probably be rewritten to use conditionals on std::get
 template<std::size_t idx, std::size_t len, typename target, typename tuple>
 struct tupleTypeIndex;
 
@@ -72,24 +54,6 @@ struct tupleTypeIndex<idx, len, target, std::tuple<head, tail...>>
   : tupleTypeIndex<idx-1, len, target, std::tuple<tail...>>
 {};
 
-template<typename target, typename...elems>
-struct getIdx;
-
-template<typename target, typename...elems>
-struct getIdx<target, std::tuple<elems...>> 
-  : tupleTypeIndex<
-      std::tuple_size_v<std::tuple<elems...>>, 
-      std::tuple_size_v<std::tuple<elems...>>, 
-      target, 
-      std::tuple<elems...>
-    >
-{};
-
-template<typename target, typename...elems>
-constexpr bool consumerInBus() {
-  return getIdx<target, elems...>::value != -1;
-};
-
 template<typename T>
 concept Messageable = requires (T t, T::MessageType m){
   typename T::MessageType;
@@ -103,27 +67,28 @@ class Consumer {
   using MessageType = T::MessageType;
 
   private:
-
     std::queue<MessageType> data_queue = {};
     std::mutex mutex;
     std::condition_variable cv;
     std::thread thread;
     std::atomic<bool> running;
 
-
   public:
 
     Consumer(std::shared_ptr<T> messageable)
     {
 
-      running.store(true);
       thread = std::thread( [this, messageable = std::move(messageable)] {
 
         std::unique_lock<std::mutex> lock = std::unique_lock(mutex);
-        while ( running.load() ) {
+        
+        // start barrier
+        cv.wait(lock, [this]{return running.load(); });
 
-          while ( running.load() && !data_queue.empty() ){
-            auto data = std::move(data_queue.front() );
+        while (running.load()) {
+
+          while (running.load() && !data_queue.empty()) {
+            auto data = std::move(data_queue.front());
             data_queue.pop();
 
             lock.unlock();
@@ -141,8 +106,11 @@ class Consumer {
       thread.join();
     }
 
+    void start(){
+      running.store(true);
+    }
     
-    // allows in-place construction of matching messages. -> maybe inadvisable?
+    // allows in-place construction of matching messages.
     template<typename...V>
     void queue(V&&...data){
       {
@@ -154,49 +122,92 @@ class Consumer {
 
 };
 
+template<typename target, typename...elems>
+struct getIdx;
+
+template<typename target, typename...elems>
+struct getIdx<target, std::tuple<std::optional<Consumer<elems>>...>> 
+  : tupleTypeIndex<
+      std::tuple_size_v<std::tuple<elems...>>, 
+      std::tuple_size_v<std::tuple<elems...>>, 
+      target, 
+      std::tuple<elems...>
+    >
+{};
+
+template<typename target, typename...elems>
+constexpr bool consumerInBus() {
+  return getIdx<target, elems...>::value != -1;
+};
+
+
 template<typename T>
 concept ConsumerType = std::is_constructible_v<Consumer<T>,std::shared_ptr<T>>;
 
 template<ConsumerType...T>
-class Bus
-{
-
+class Bus {
   std::tuple<std::optional<Consumer<T>>...> subscribers;
+  std::atomic<bool> started = false;
 
   public:
-    //template<
-    //  typename U, 
-    //  std::enable_if_t<consumerInBus<U,decltype(subscribers)>(),bool> = true
-    //>
-    //void subscribe(U&& u){
-    //  std::get<getIdx<U,decltype(subscribers)>::value>(subscribers) = std::move(u);
-    //}
     
-    template<ConsumerType U>
+    template<
+      ConsumerType U, 
+      std::enable_if_t<consumerInBus<U,decltype(subscribers)>(),bool> = true
+    > 
     void subscribe(std::shared_ptr<U> subscriber){
-      //std::optional<Consumer<U>> val = std::make_optional<Consumer<U>>(std::move(subscriber));
-      //std::get<std::optional<Consumer<U>>>(subscribers) = std::make_optional<Consumer<U>>(std::move(subscriber));
       std::get<std::optional<Consumer<U>>>(subscribers).emplace(std::move(subscriber));
     }
+    
+    void start(){
+
+      // are the consumers populated?
+      bool ready = std::apply( 
+        [&](std::optional<Consumer<T>>&...sub){
+          return ( sub.has_value() && ... );
+        },
+        subscribers
+      );
+
+      // if not, RBD
+      if (!ready) {
+        throw std::runtime_error("Bus has uninitialized consumers");
+      }
+
+      // else, start all consumers.
+      std::apply( 
+          [&](std::optional<Consumer<T>>&...sub){
+            ( sub->start(), ... );
+          },
+          subscribers
+      );
+      started.store(true);
+    }
+
 
     template<
       ConsumerType U, 
       typename...V,
-      std::enable_if_t<std::is_constructible_v<typename U::MessageType, V...>,bool> = true
+      std::enable_if_t<std::is_constructible_v<typename U::MessageType, V...>,bool> = true,
+      std::enable_if_t<consumerInBus<U,decltype(subscribers)>(),bool> = true
     >
     void message(V&&...data) {
+      if (!started.load()) {
+        throw std::runtime_error("Bus has not been started.");
+      }
       auto& opt = std::get<std::optional<Consumer<U>>>(subscribers);
       opt->queue(std::forward<V>(data)...);
     }
 
+
     ~Bus(){
+      // reset, call destructors on all consumers, bring down the queues.
       std::apply( 
         [&](std::optional<Consumer<T>>&...sub){
           ( sub.reset(), ... );
         },
         subscribers
       );
-
     }
 
 };
