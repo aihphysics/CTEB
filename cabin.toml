@@ -1,0 +1,5 @@
+[package]
+name = "bus"
+version = "0.1.0"
+authors = ["Alina Hagan <alina-hagan@outlook.com>"]
+edition = "23"
